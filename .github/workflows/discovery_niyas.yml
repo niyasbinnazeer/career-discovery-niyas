@@ -24,4 +24,5 @@ jobs:
           CAREER_ANALYZER_URL: ${{ secrets.CAREER_ANALYZER_URL }}
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          JOOBLE_API_KEY: ${{ secrets.JOOBLE_API_KEY }}
         run: node discovery_niyas.mjs
