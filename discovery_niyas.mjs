@@ -95,6 +95,28 @@ const CONFIG = {
   ],
   JOOBLE_CALLS_PER_RUN: 12,
   JOOBLE_RESULTS_PER_CALL: 20,
+
+  // ---- JOBICY (free, no key) — remote jobs, has an "education" category ----
+  // Remote roles are often visa-free. No request cap; we keep it polite (~5/run).
+  JOBICY_ENABLED: true,
+  JOBICY_CALLS: [
+    { industry: "education" },
+    { tag: "instructional designer" },
+    { tag: "learning experience" },
+    { tag: "elearning" },
+    { tag: "learning designer" },
+  ],
+  JOBICY_RESULTS_PER_CALL: 50,
+
+  // ---- HIMALAYAS (free, no key) — remote jobs, direct links ----
+  HIMALAYAS_ENABLED: true,
+  HIMALAYAS_QUERIES: [
+    "instructional designer",
+    "learning experience designer",
+    "elearning developer",
+    "learning designer",
+    "learning and development",
+  ],
 };
 
 // =============================================================================
@@ -389,6 +411,53 @@ async function pickJoobleSlice() {
   return slice;
 }
 
+async function fetchJobicy(params, report) {
+  const label = params.industry ? `industry=${params.industry}` : `tag=${params.tag}`;
+  const qs = new URLSearchParams({ count: String(CONFIG.JOBICY_RESULTS_PER_CALL), ...params });
+  try {
+    const res = await fetch(`https://jobicy.com/api/v2/remote-jobs?${qs}`);
+    if (!res.ok) { report.push(`jobicy:${label} -> HTTP ${res.status}`); return []; }
+    const data = await res.json();
+    const jobs = (data.jobs || []).map(j => ({
+      title: j.jobTitle || "",
+      company: j.companyName || "",
+      location: j.jobGeo || "Remote",
+      url: j.url || "",
+      description: stripHtml(j.jobDescription || j.jobExcerpt || ""),
+      postedDate: j.pubDate || "",
+    }));
+    report.push(`jobicy:${label} -> ${jobs.length}`);
+    return jobs;
+  } catch (e) { report.push(`jobicy:${label} -> ERR ${e.message}`); return []; }
+}
+
+async function fetchHimalayas(query, report) {
+  // Field names mapped defensively (title/company/url variants) — if a run returns
+  // counts but nothing passes, check the raw shape and adjust the field names.
+  try {
+    const res = await fetch(`https://himalayas.app/jobs/api/search?keywords=${encodeURIComponent(query)}&limit=20`);
+    if (!res.ok) { report.push(`himalayas:"${query}" -> HTTP ${res.status}`); return []; }
+    const data = await res.json();
+    const arr = data.jobs || data.data || [];
+    const jobs = arr.map(j => {
+      let posted = j.pubDate || j.publishedDate || j.updated || "";
+      if (typeof posted === "number") posted = new Date(posted * 1000).toISOString();
+      const loc = Array.isArray(j.locationRestrictions) && j.locationRestrictions.length
+        ? j.locationRestrictions.join(", ") : "Remote";
+      return {
+        title: j.title || j.jobTitle || "",
+        company: j.companyName || j.company || "",
+        location: loc,
+        url: j.applicationLink || j.url || j.guid || "",
+        description: stripHtml(j.description || j.excerpt || ""),
+        postedDate: posted,
+      };
+    });
+    report.push(`himalayas:"${query}" -> ${jobs.length}`);
+    return jobs;
+  } catch (e) { report.push(`himalayas:"${query}" -> ERR ${e.message}`); return []; }
+}
+
 // =============================================================================
 // ROUND-ROBIN INTERLEAVE — balance jobs across sources before analyzing
 // =============================================================================
@@ -480,6 +549,12 @@ async function main() {
     }
   } else if (CONFIG.JOOBLE_ENABLED) {
     report.push("jooble -> skipped (JOOBLE_API_KEY not set)");
+  }
+  if (CONFIG.JOBICY_ENABLED) {
+    for (const p of CONFIG.JOBICY_CALLS) collected.push(...await fetchJobicy(p, report));
+  }
+  if (CONFIG.HIMALAYAS_ENABLED) {
+    for (const q of CONFIG.HIMALAYAS_QUERIES) collected.push(...await fetchHimalayas(q, report));
   }
   report.push(`--- collected ${collected.length} raw postings ---`);
 
