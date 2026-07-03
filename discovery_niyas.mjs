@@ -210,20 +210,64 @@ function stripHtml(s) {
     .trim();
 }
 
-// Follow HTTP redirects (headers only, no body) to find where an aggregator's
-// apply link actually lands — i.e. the real posting/apply URL behind Adzuna's or
-// Jooble's tracking link. Falls back to the original URL on any timeout/error.
-async function resolveFinalUrl(url, maxHops = 6) {
-  const UA = "Mozilla/5.0 (compatible; CareerDiscovery/1.0)";
+// Decode the handful of HTML entities that show up inside URLs.
+function decodeHtmlUrl(s) {
+  return (s || "")
+    .replace(/&amp;/g, "&").replace(/&#38;/g, "&")
+    .replace(/&quot;/g, '"').replace(/&#34;/g, '"')
+    .replace(/&#39;/g, "'").replace(/&#x2f;/gi, "/");
+}
+
+// Pull the "real" destination out of an aggregator page body. Adzuna's land/ad and
+// details pages usually redirect via meta-refresh or JS, or link out via a land/ad
+// href or JSON-LD — none of which an HTTP-redirect follower can see. Order matters.
+function extractRedirectFromHtml(html, baseUrl) {
+  if (!html) return "";
+  const abs = (u) => { try { return new URL(decodeHtmlUrl(u), baseUrl).href; } catch { return ""; } };
+  const offAgg = (u) => u && !/adzuna\.|jooble\.org/i.test(u);
+
+  // 1. <meta http-equiv="refresh" content="0; url=...">
+  let m = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=([^"'>\s]+)/i);
+  if (m) { const u = abs(m[1]); if (offAgg(u)) return u; }
+
+  // 2. JS redirect: window.location = "..." / location.replace("...")
+  m = html.match(/(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i)
+    || html.match(/location\.replace\(\s*["']([^"']+)["']\s*\)/i);
+  if (m) { const u = abs(m[1]); if (offAgg(u)) return u; }
+
+  // 3. A land/ad tracking link on the page (details page → follow it next hop).
+  m = html.match(/href=["']([^"']*\/(?:jobs\/)?land\/ad\/\d+[^"']*)["']/i);
+  if (m) { const u = abs(m[1]); if (u) return u; }
+
+  // 4. JSON-LD JobPosting carrying an external url / applyUrl.
+  const lds = html.match(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const block of lds) {
+    try {
+      const parsed = JSON.parse(block.replace(/<script[^>]*>/i, "").replace(/<\/script>/i, "").trim());
+      for (const o of (Array.isArray(parsed) ? parsed : [parsed])) {
+        const cand = o && (o.url || o.sameAs || (o.hiringOrganization && o.hiringOrganization.sameAs)
+          || (o.potentialAction && o.potentialAction.target && (o.potentialAction.target.urlTemplate || o.potentialAction.target.url)));
+        if (typeof cand === "string" && offAgg(cand)) return cand;
+      }
+    } catch {}
+  }
+  return "";
+}
+
+// Resolve an aggregator link to its true external destination. Follows HTTP
+// redirects AND reads the page body for meta/JS/link redirects. Falls back to the
+// original URL on any timeout/error so a job is never lost.
+async function resolveFinalUrl(url, maxHops = 8) {
+  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
   let current = url;
-  for (let i = 0; i < maxHops; i++) {
+  for (let hop = 0; hop < maxHops; hop++) {
     let res;
     try {
       res = await fetch(current, {
         method: "GET",
         redirect: "manual",
-        headers: { "User-Agent": UA },
-        signal: AbortSignal.timeout(7000),
+        headers: { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml" },
+        signal: AbortSignal.timeout(9000),
       });
     } catch {
       return current;
@@ -234,7 +278,15 @@ async function resolveFinalUrl(url, maxHops = 6) {
       try { current = new URL(loc, current).href; } catch { return current; }
       continue;
     }
-    return current; // 2xx / 4xx / 5xx — final landing URL
+    // 2xx and still on an aggregator domain — look inside the page for the real link.
+    if (res.status >= 200 && res.status < 300 && /adzuna\.|jooble\.org/i.test(current)) {
+      let html = "";
+      try { html = await res.text(); } catch { return current; }
+      const next = extractRedirectFromHtml(html, current);
+      if (next && next !== current) { current = next; continue; }
+      return current;
+    }
+    return current;
   }
   return current;
 }
