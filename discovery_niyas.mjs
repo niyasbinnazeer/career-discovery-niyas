@@ -10,14 +10,14 @@ import { createHash } from "node:crypto";
 // CONFIG
 // =============================================================================
 const CONFIG = {
-  // Max jobs analyzed per run. 40/run × 3 runs/day = 120/day — safely within
-  // the Gemini free tier (500/day); Haiku absorbs any overflow.
-  MAX_ANALYZE_PER_RUN: 40,
+  // Max jobs analyzed per run. Set to 75 to comfortably guarantee at least 30+ jobs per run.
+  MAX_ANALYZE_PER_RUN: 75,
+  TARGET_MIN_ANALYZE: 30,
 
-  // Dedup keys persist 120 days, then expire — re-postings don't re-analyze.
-  SEEN_TTL_SECONDS: 60 * 60 * 24 * 120,
+  // Dedup keys persist 21 days (fresh window), preventing stale multi-month locks
+  SEEN_TTL_SECONDS: 60 * 60 * 24 * 21,
 
-  // Company ATS boards (EdTech + scaleups with dedicated L&D / enablement orgs).
+  // Company ATS boards (EdTech + tech scaleups with dedicated L&D / enablement orgs).
   ATS: {
     greenhouse: [
       // EdTech / learning companies (highest yield for L&D roles)
@@ -26,6 +26,10 @@ const CONFIG = {
       "docebo", "go1", "360learning", "instructure", "udemy", "skillsoft",
       "chegg", "quizlet", "brilliant", "masterclass", "newsela", "edmentum",
       "labster", "paper", "panorama", "nerdy", "learnupon", "cornerstone",
+      // Indian tech / unicorns with active L&D / enablement teams
+      "swiggy", "cred", "razorpay", "phonepe", "meesho", "zomato",
+      "unacademy", "simplilearn", "eruditus", "upgrad", "lead", "thoughtworks",
+      "inmobi", "flipkart", "postman", "freshworks",
       // Large tech / scale-ups with mature learning & enablement functions
       "stripe", "databricks", "figma", "notion", "gitlab", "asana",
       "dropbox", "twilio", "airbnb", "pinterest", "reddit", "doordash",
@@ -34,66 +38,89 @@ const CONFIG = {
       "affirm", "coinbase", "discord", "canva", "atlassian", "shopify",
       "wise", "revolut", "deliveroo", "snowflake",
     ],
-    lever: [],
-    ashby: [],
+    lever: [
+      "sanalabs", "uplimit", "lingoda", "maven", "springboard",
+      "cambly", "classdojo", "multiverse", "highspot", "benchling",
+      "outreach", "grammarly", "automattic",
+    ],
+    ashby: [
+      "synthesisschool", "deel", "replit", "cursor", "perplexity",
+      "openai", "anthropic",
+    ],
   },
 
-  // ---- ADZUNA (19 countries, rotated across runs) ----
+  // ---- ADZUNA (19 countries, prioritized across runs) ----
   ADZUNA_ENABLED: true,
   ADZUNA_COUNTRIES: [
-    "gb", "us", "ca", "au", "in", "sg", "nz", "de", "fr", "nl",
-    "it", "es", "at", "be", "ch", "pl", "br", "mx", "za",
+    "in", "gb", "us", "sg", "de", "ae", "au", "ca", "nl", "ie",
+    "at", "be", "ch", "pl", "fr", "es", "it", "nz", "za",
   ],
   ADZUNA_QUERIES: [
     "instructional designer",
-    "elearning developer",
     "learning experience designer",
+    "elearning developer",
     "learning designer",
-    "learning technologist",
     "learning and development specialist",
+    "curriculum developer",
     "instructional design",
     "articulate storyline",
-    "learning engineer",
-    "curriculum developer",
+    "learning technologist",
     "digital learning designer",
+    "learning engineer",
     "training content developer",
   ],
-  ADZUNA_CALLS_PER_RUN: 8,
-  ADZUNA_RESULTS_PER_CALL: 25,
+  ADZUNA_CALLS_PER_RUN: 16,
+  ADZUNA_RESULTS_PER_CALL: 50,
   ADZUNA_MAX_DAYS_OLD: 14,
 
-  // ---- JOOBLE (Lifetime free quota of 500 requests — bundled queries) ----
+  // ---- JOOBLE ----
   JOOBLE_ENABLED: true,
   JOOBLE_LOCATIONS: [
-    "Remote",
     "India",
+    "Bengaluru",
+    "Remote",
+    "Worldwide",
     "United Arab Emirates",
     "Dubai",
     "Singapore",
-    "United States Remote",
     "United Kingdom Remote",
+    "United States Remote",
   ],
   // Comma-separated query bundles all keywords into a single Jooble request per location.
-  JOOBLE_COMBINED_KEYWORDS: "instructional designer, elearning developer, learning experience designer, l&d specialist",
-  JOOBLE_CALLS_PER_RUN: 2, // 2 locations/run × 3 runs/day = 6 calls/day (~83 days on 500 lifetime quota)
-  JOOBLE_RESULTS_PER_CALL: 20,
+  JOOBLE_COMBINED_KEYWORDS: "instructional designer, elearning developer, learning experience designer, l&d specialist, curriculum developer",
+  JOOBLE_CALLS_PER_RUN: 6,
+  JOOBLE_RESULTS_PER_CALL: 40,
 
   // ---- LINKEDIN JOBS (Public guest search — no API key needed) ----
   LINKEDIN_ENABLED: true,
   LINKEDIN_QUERIES: [
-    '"instructional designer" OR "learning experience designer"',
-    '"elearning developer" OR "learning designer" OR "instructional design"',
+    '"instructional designer"',
+    '"learning experience designer"',
+    '"elearning developer"',
+    '"instructional design"',
+    '"learning designer"',
+    '"curriculum developer"',
+    '"learning and development"',
   ],
-  LINKEDIN_LOCATIONS: ["Remote", "United States", "United Kingdom", "United Arab Emirates"],
-  LINKEDIN_MAX_PER_QUERY: 15,
+  LINKEDIN_LOCATIONS: [
+    "India",
+    "Bengaluru",
+    "Remote",
+    "United Arab Emirates",
+    "United Kingdom",
+    "United States",
+  ],
+  LINKEDIN_MAX_PER_QUERY: 25,
 
   // ---- JSEARCH (Google for Jobs via RapidAPI — optional, activates if RAPIDAPI_KEY set) ----
   JSEARCH_ENABLED: true,
   JSEARCH_QUERIES: [
     "Instructional Designer",
-    "eLearning Developer OR Learning Experience Designer",
+    "Learning Experience Designer",
+    "eLearning Developer",
+    "Curriculum Developer",
   ],
-  JSEARCH_LOCATIONS: ["Remote", "United Kingdom", "United States", "United Arab Emirates"],
+  JSEARCH_LOCATIONS: ["India", "Remote", "United Kingdom", "United States", "United Arab Emirates"],
 
   // ---- JOBICY (free, no key — remote jobs) ----
   JOBICY_ENABLED: true,
@@ -103,6 +130,8 @@ const CONFIG = {
     { tag: "learning experience" },
     { tag: "elearning" },
     { tag: "learning designer" },
+    { tag: "curriculum" },
+    { tag: "training" },
   ],
   JOBICY_RESULTS_PER_CALL: 50,
 
@@ -114,6 +143,8 @@ const CONFIG = {
     "elearning developer",
     "learning designer",
     "learning and development",
+    "curriculum",
+    "training specialist",
   ],
 };
 
@@ -188,26 +219,21 @@ function isTitleExcluded(title) {
 function isLocationEligible(job) {
   const loc = (job.location || "").toLowerCase();
   const text = `${job.title || ""} ${job.location || ""} ${job.description || ""}`.toLowerCase();
-
-  // If directly from company ATS (Greenhouse, Lever, Ashby, etc.), keep it
   const url = job.url || "";
-  const isAggregator = /jooble\.org|adzuna\./i.test(url);
-  if (!isAggregator) return true;
 
-  // India, UAE, and Singapore are direct hiring/relocation markets for Niyas
-  if (/india|bengaluru|bangalore|hyderabad|mumbai|delhi|pune|chennai|noida|gurgaon/.test(loc)) return true;
-  if (/dubai|abu dhabi|uae|emirates|singapore/.test(loc)) return true;
+  // Only Jooble actively blocks overseas candidates on US/Canada on-site postings ("requires local presence")
+  if (/jooble\.org/i.test(url)) {
+    if (/remote|work from home|wfh|anywhere|worldwide|distributed|virtual/.test(loc)) return true;
+    if (/\b(?:100%\s*remote|fully\s*remote|remote\s*(?:first|eligible|friendly|option)|work\s*from\s*anywhere)\b/.test(text)) return true;
+    if (/india|bengaluru|bangalore|hyderabad|mumbai|delhi|pune|chennai|noida|gurgaon/.test(loc)) return true;
+    if (/dubai|abu dhabi|uae|emirates|singapore/.test(loc)) return true;
+    if (/uk|united kingdom|london|england|germany|netherlands|ireland|europe/.test(loc)) return true;
+    if (/visa|relocation|sponsor/.test(text)) return true;
+    return false;
+  }
 
-  // Remote roles are eligible anywhere
-  if (/remote|work from home|wfh|anywhere|worldwide|distributed|virtual/.test(loc)) return true;
-  if (/\b(?:100%\s*remote|fully\s*remote|remote\s*(?:first|eligible|friendly|option)|work\s*from\s*anywhere)\b/.test(text)) return true;
-
-  // Roles with visa sponsorship or relocation assistance
-  if (/visa\s*(?:sponsorship|sponsored|support)|relocation\s*(?:assistance|provided|support|package)/.test(text)) return true;
-
-  // Otherwise, an on-site job in US/UK/Canada/EU from Jooble/Adzuna requires local presence
-  // and Jooble blocks the candidate with "This position requires local presence"
-  return false;
+  // All direct ATS (Greenhouse/Lever/Ashby), LinkedIn, Adzuna, Himalayas, Jobicy jobs are eligible
+  return true;
 }
 
 function prefilterPass(job) {
@@ -258,7 +284,8 @@ function thinTextWorthAnalyzing(title) {
     "learning", "training", "instructional", "elearning", "e-learning",
     "curriculum", "course", "education", "lms", "edtech", "scorm", "xapi",
     "storyline", "captivate", "articulate", "instructional design",
-    "learning experience", "learning design",
+    "learning experience", "learning design", "lxd", "l&d", "enablement",
+    "pedagogy", "instruction", "trainer", "talent development",
   ];
   return DOMAIN.some(d => t.includes(d));
 }
@@ -446,7 +473,7 @@ function cleanTrackingParams(rawUrl) {
 
 function seenKey(url) {
   const cleaned = cleanTrackingParams(url);
-  return "seen:" + sha1Hex(cleaned).slice(0, 24);
+  return "seen:v2:" + sha1Hex(cleaned).slice(0, 24);
 }
 
 function normalizeForFingerprint(s) {
@@ -460,7 +487,7 @@ function normalizeForFingerprint(s) {
 function fingerprintKey(job) {
   const company = normalizeForFingerprint(job.company).split(" ").slice(0, 2).join(" ");
   const title = normalizeForFingerprint(job.title);
-  return "fp:" + sha1Hex(`${company}|${title}`).slice(0, 24);
+  return "fp:v2:" + sha1Hex(`${company}|${title}`).slice(0, 24);
 }
 
 function normalizePostedDate(raw) {
@@ -1040,8 +1067,8 @@ async function main() {
   };
 
   for (const job of collected) {
-    if (attempts >= CONFIG.MAX_ANALYZE_PER_RUN) {
-      report.push(`hit MAX_ANALYZE_PER_RUN (${CONFIG.MAX_ANALYZE_PER_RUN} attempts) — remaining roll to next run`);
+    if (analyzed >= CONFIG.MAX_ANALYZE_PER_RUN) {
+      report.push(`hit MAX_ANALYZE_PER_RUN (${CONFIG.MAX_ANALYZE_PER_RUN} jobs analyzed) — remaining roll to next run`);
       break;
     }
     if (!job.url) continue;
@@ -1081,6 +1108,7 @@ async function main() {
     const ok = await analyzeAndSave(job, report);
     if (ok) {
       analyzed++;
+      console.log(`[progress] Added job ${analyzed}/${CONFIG.MAX_ANALYZE_PER_RUN}: ${job.company} - ${job.title}`);
       bump(job.company, "analyzed");
 
       // CRITICAL FIX: Only write permanent dedup keys to KV on SUCCESSFUL analysis.
