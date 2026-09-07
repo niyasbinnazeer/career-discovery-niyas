@@ -26,11 +26,8 @@ const CONFIG = {
       "docebo", "go1", "360learning", "instructure", "udemy", "skillsoft",
       "chegg", "quizlet", "brilliant", "masterclass", "newsela", "edmentum",
       "labster", "paper", "panorama", "nerdy", "learnupon", "cornerstone",
-      // Indian tech / unicorns with active L&D / enablement teams
-      "swiggy", "cred", "razorpay", "phonepe", "meesho", "zomato",
-      "unacademy", "simplilearn", "eruditus", "upgrad", "lead", "thoughtworks",
-      "inmobi", "flipkart", "postman", "freshworks",
-      // Large tech / scale-ups with mature learning & enablement functions
+      // Global tech with verified active boards
+      "thoughtworks", "inmobi", "postman", "freshworks",
       "stripe", "databricks", "figma", "notion", "gitlab", "asana",
       "dropbox", "twilio", "airbnb", "pinterest", "reddit", "doordash",
       "instacart", "robinhood", "brex", "ramp", "gusto", "samsara",
@@ -40,12 +37,11 @@ const CONFIG = {
     ],
     lever: [
       "sanalabs", "uplimit", "lingoda", "maven", "springboard",
-      "cambly", "classdojo", "multiverse", "highspot", "benchling",
-      "outreach", "grammarly", "automattic",
+      "cambly", "classdojo", "highspot", "benchling", "outreach",
+      "grammarly", "automattic",
     ],
     ashby: [
-      "synthesisschool", "deel", "replit", "cursor", "perplexity",
-      "openai", "anthropic",
+      "synthesisschool", "deel", "replit",
     ],
   },
 
@@ -94,21 +90,15 @@ const CONFIG = {
   // ---- LINKEDIN JOBS (Public guest search — no API key needed) ----
   LINKEDIN_ENABLED: true,
   LINKEDIN_QUERIES: [
-    '"instructional designer"',
-    '"learning experience designer"',
-    '"elearning developer"',
-    '"instructional design"',
-    '"learning designer"',
-    '"curriculum developer"',
-    '"learning and development"',
+    '"instructional designer" OR "learning experience designer"',
+    '"elearning developer" OR "learning designer"',
+    '"curriculum developer" OR "learning technologist"',
   ],
   LINKEDIN_LOCATIONS: [
     "India",
-    "Bengaluru",
     "Remote",
     "United Arab Emirates",
     "United Kingdom",
-    "United States",
   ],
   LINKEDIN_MAX_PER_QUERY: 25,
 
@@ -149,7 +139,7 @@ const CONFIG = {
 };
 
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-const FETCH_TIMEOUT_MS = 12000;
+const FETCH_TIMEOUT_MS = 5000;
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -998,30 +988,25 @@ async function main() {
         }
 
         for (const card of cards.slice(0, CONFIG.LINKEDIN_MAX_PER_QUERY)) {
-          // Pre-check KV before fetching detail page
+          // Pre-check KV before queuing
           const sk = seenKey(card.url);
           const alreadySeen = await kvGet(sk);
           if (alreadySeen) continue;
 
-          let detail = { snippet: "", postedDate: "" };
-          try {
-            detail = await fetchLinkedInDetail(card.id);
-            await sleep(250); // polite crawl delay
-          } catch {
-            detail.snippet = card.title;
-          }
-
           collected.push({
+            id: card.id,
             title: card.title,
             company: card.company,
             location: card.location,
             url: card.url,
-            description: detail.snippet || card.title,
-            postedDate: detail.postedDate || "",
+            description: card.title,
+            postedDate: "",
+            thinText: true,
+            isLinkedIn: true,
           });
           linkedInFound++;
         }
-        await sleep(350);
+        await sleep(100);
       }
     }
     report.push(`linkedin -> ${linkedInFound} postings harvested`);
@@ -1097,12 +1082,16 @@ async function main() {
 
     attempts++;
 
-    // Resolve off-aggregator apply destination if available
-    if (/adzuna\.|jooble\.org|linkedin\.com/i.test(job.url) && !job.directApplyUrl) {
-      const resolved = await resolveDirectApplyUrl(job.url);
-      if (resolved && resolved !== job.url) {
-        job.directApplyUrl = resolved;
-      }
+    // Just-in-time LinkedIn detail fetch (only for the jobs actually picked for analysis)
+    if (job.isLinkedIn && job.id && job.description === job.title) {
+      try {
+        const detail = await fetchLinkedInDetail(job.id);
+        if (detail.snippet) {
+          job.description = detail.snippet;
+          job.thinText = false;
+        }
+        if (detail.postedDate) job.postedDate = detail.postedDate;
+      } catch {}
     }
 
     const ok = await analyzeAndSave(job, report);
