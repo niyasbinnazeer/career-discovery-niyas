@@ -75,12 +75,10 @@ const CONFIG = {
     "India",
     "Bengaluru",
     "Remote",
-    "Worldwide",
+    "Worldwide Remote",
     "United Arab Emirates",
     "Dubai",
     "Singapore",
-    "United Kingdom Remote",
-    "United States Remote",
   ],
   // Comma-separated query bundles all keywords into a single Jooble request per location.
   JOOBLE_COMBINED_KEYWORDS: "instructional designer, elearning developer, learning experience designer, l&d specialist, curriculum developer",
