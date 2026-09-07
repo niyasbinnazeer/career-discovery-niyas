@@ -1,38 +1,23 @@
 // discovery_niyas.mjs — Node.js discovery job for Niyas's L&D / eLearning search.
-// Mirrors Sudakshina's discovery script structure; profile, queries, sources, and
-// keyword filters are Niyas's. Runs as a GitHub Actions scheduled job (no Cloudflare
-// Workers subrequest cap).
+// Discovers, pre-filters, dedupes against Cloudflare KV, resolves off-aggregator apply links,
+// and submits jobs to career-intelligence-api-niyas for AI analysis.
 //
-// SECRETS REQUIRED (GitHub repo → Settings → Secrets and variables → Actions):
-//   CF_ACCOUNT_ID        — your Cloudflare account ID (SAME as Sudakshina's — same account)
-//   CF_API_TOKEN         — Cloudflare API token with KV read+write (SAME token works)
-//   CF_KV_NAMESPACE_ID   — KV namespace ID of `career_jobs_niyas` (NEW — yours)
-//   CAREER_ANALYZER_URL  — https://career-intelligence-api-niyas.<sub>.workers.dev
-//   ADZUNA_APP_ID        — your NEW Adzuna app id
-//   ADZUNA_APP_KEY       — your NEW Adzuna app key
-//
-// NOTE ON GEMINI: your career-intelligence-api-niyas worker should use its OWN
-// Gemini API key (separate Google AI Studio project) so it has an independent
-// 500/day free pool. Sharing Sudakshina's key would push most of your analyses to
-// the paid Haiku fallback, because her discovery already consumes ~480/day.
-//
-// Run locally for testing:  node discovery_niyas.mjs
+// Designed to run as a scheduled GitHub Action (no Cloudflare Workers subrequest cap).
+
+import { createHash } from "node:crypto";
 
 // =============================================================================
 // CONFIG
 // =============================================================================
 const CONFIG = {
-  // No subrequest cap on GitHub Actions. 40/run × 12 runs/day = 480/day max —
-  // within your analyzer's OWN Gemini Flash-Lite free tier (500/day); Haiku
-  // absorbs any overflow.
+  // Max jobs analyzed per run. 40/run × 3 runs/day = 120/day — safely within
+  // the Gemini free tier (500/day); Haiku absorbs any overflow.
   MAX_ANALYZE_PER_RUN: 40,
 
   // Dedup keys persist 120 days, then expire — re-postings don't re-analyze.
   SEEN_TTL_SECONDS: 60 * 60 * 24 * 120,
 
-  // Company ATS boards. Seeded broad (EdTech + tech with real L&D orgs). The
-  // fetchGreenhouse adapter handles 404s gracefully — wrong tokens are silently
-  // skipped, so adding probable tokens is safe (working ones add jobs).
+  // Company ATS boards (EdTech + scaleups with dedicated L&D / enablement orgs).
   ATS: {
     greenhouse: [
       // EdTech / learning companies (highest yield for L&D roles)
@@ -53,20 +38,17 @@ const CONFIG = {
     ashby: [],
   },
 
+  // ---- ADZUNA (19 countries, rotated across runs) ----
   ADZUNA_ENABLED: true,
-  // ALL 19 Adzuna-supported countries — maximum coverage, no restriction.
   ADZUNA_COUNTRIES: [
-    "gb","us","ca","au","in","sg","nz","de","fr","nl",
-    "it","es","at","be","ch","pl","br","mx","za",
+    "gb", "us", "ca", "au", "in", "sg", "nz", "de", "fr", "nl",
+    "it", "es", "at", "be", "ch", "pl", "br", "mx", "za",
   ],
-  // L&D / eLearning / instructional-design query set.
   ADZUNA_QUERIES: [
     "instructional designer",
     "elearning developer",
-    "e-learning developer",
     "learning experience designer",
     "learning designer",
-    "learning experience developer",
     "learning technologist",
     "learning and development specialist",
     "instructional design",
@@ -74,30 +56,41 @@ const CONFIG = {
     "learning engineer",
     "curriculum developer",
     "digital learning designer",
-    "learning content developer",
     "training content developer",
   ],
-  // Per-run cap on Adzuna rotation calls (cursor cycles the full country×query
-  // matrix over successive runs). 10/run × 12 runs/day = 120 Adzuna calls/day —
-  // conservative against the free tier. Raise for faster matrix coverage.
-  ADZUNA_CALLS_PER_RUN: 10,
+  ADZUNA_CALLS_PER_RUN: 8,
   ADZUNA_RESULTS_PER_CALL: 25,
   ADZUNA_MAX_DAYS_OLD: 14,
 
-  // ---- JOOBLE (free key, ~500 req/day) — direct source links + UAE coverage ----
-  // Budgeted like Adzuna: a rotating slice each run keeps daily usage well under
-  // the 500/day cap. 12 calls/run × 12 runs/day = 144/day. Locations are passed as
-  // strings (Jooble has no country codes). Reuses the same L&D query set.
+  // ---- JOOBLE (Lifetime free quota of 500 requests — bundled queries) ----
   JOOBLE_ENABLED: true,
   JOOBLE_LOCATIONS: [
-    "United Kingdom","United States","Canada","Australia","India","Singapore",
-    "United Arab Emirates","Dubai","Germany","Netherlands","Ireland","Remote",
+    "United Kingdom", "United States", "Canada", "Australia", "India", "Singapore",
+    "United Arab Emirates", "Dubai", "Germany", "Netherlands", "Ireland", "Remote",
   ],
-  JOOBLE_CALLS_PER_RUN: 12,
+  // Comma-separated query bundles all keywords into a single Jooble request per location.
+  JOOBLE_COMBINED_KEYWORDS: "instructional designer, elearning developer, learning experience designer, l&d specialist",
+  JOOBLE_CALLS_PER_RUN: 2, // 2 locations/run × 3 runs/day = 6 calls/day (~83 days on 500 lifetime quota)
   JOOBLE_RESULTS_PER_CALL: 20,
 
-  // ---- JOBICY (free, no key) — remote jobs, has an "education" category ----
-  // Remote roles are often visa-free. No request cap; we keep it polite (~5/run).
+  // ---- LINKEDIN JOBS (Public guest search — no API key needed) ----
+  LINKEDIN_ENABLED: true,
+  LINKEDIN_QUERIES: [
+    '"instructional designer" OR "learning experience designer"',
+    '"elearning developer" OR "learning designer" OR "instructional design"',
+  ],
+  LINKEDIN_LOCATIONS: ["Remote", "United States", "United Kingdom", "United Arab Emirates"],
+  LINKEDIN_MAX_PER_QUERY: 15,
+
+  // ---- JSEARCH (Google for Jobs via RapidAPI — optional, activates if RAPIDAPI_KEY set) ----
+  JSEARCH_ENABLED: true,
+  JSEARCH_QUERIES: [
+    "Instructional Designer",
+    "eLearning Developer OR Learning Experience Designer",
+  ],
+  JSEARCH_LOCATIONS: ["Remote", "United Kingdom", "United States", "United Arab Emirates"],
+
+  // ---- JOBICY (free, no key — remote jobs) ----
   JOBICY_ENABLED: true,
   JOBICY_CALLS: [
     { industry: "education" },
@@ -108,7 +101,7 @@ const CONFIG = {
   ],
   JOBICY_RESULTS_PER_CALL: 50,
 
-  // ---- HIMALAYAS (free, no key) — remote jobs, direct links ----
+  // ---- HIMALAYAS (free, no key — remote jobs) ----
   HIMALAYAS_ENABLED: true,
   HIMALAYAS_QUERIES: [
     "instructional designer",
@@ -118,6 +111,13 @@ const CONFIG = {
     "learning and development",
   ],
 };
+
+const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const FETCH_TIMEOUT_MS = 12000;
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
 
 // =============================================================================
 // SECRETS — from process.env (GitHub Actions repo secrets)
@@ -130,6 +130,7 @@ const ENV = {
   ADZUNA_APP_ID: process.env.ADZUNA_APP_ID,
   ADZUNA_APP_KEY: process.env.ADZUNA_APP_KEY,
   JOOBLE_API_KEY: process.env.JOOBLE_API_KEY,
+  RAPIDAPI_KEY: process.env.RAPIDAPI_KEY,
 };
 
 function requireEnv(keys) {
@@ -145,57 +146,90 @@ function requireEnv(keys) {
 // KEYWORD FILTERS — tuned for L&D / eLearning / instructional design
 // =============================================================================
 const STRONG_POSITIVE = [
-  "instructional design","instructional designer","elearning","e-learning",
-  "learning experience","learning designer","learning design","lxd",
-  "articulate storyline","storyline 360","storyline","rise 360","captivate",
-  "scorm","xapi","cmi5","lms","learning management","authoring tool",
-  "curriculum","course development","course design","learning and development",
-  "l&d","learning technologist","learning engineer","learning technology",
-  "training content","learning content","edtech","educational technology",
-  "wcag","accessible elearning","learning analytics","microlearning",
-  "blended learning","digital learning","instructional",
-];
-const HARD_NEGATIVE = [
-  "sales","business development","account manager","account executive",
-  "medical coding","billing","call center","call centre","customer support",
-  "customer success","recruiter","recruitment","talent acquisition","data entry",
-  "telecaller","bpo","insurance","real estate","warehouse","logistics",
-  "procurement","supply chain","accountant","bookkeeper","tax associate","audit",
-  "nurse","nursing","physician","pharmacist","clinical research","lab technician",
-  "machine learning","deep learning","data scientist","data engineer",
-  "software engineer","backend developer","back-end developer","devops",
-  "full stack developer","full-stack developer","security engineer",
-  "electrician","plumber","driver","security guard","machine operator",
+  "instructional design", "instructional designer", "elearning", "e-learning",
+  "learning experience", "learning designer", "learning design", "lxd",
+  "articulate storyline", "storyline 360", "storyline", "rise 360", "captivate",
+  "scorm", "xapi", "cmi5", "lms", "learning management", "authoring tool",
+  "curriculum", "course development", "course design", "learning and development",
+  "l&d", "learning technologist", "learning engineer", "learning technology",
+  "training content", "learning content", "edtech", "educational technology",
+  "wcag", "accessible elearning", "learning analytics", "microlearning",
+  "blended learning", "digital learning", "instructional",
 ];
 
-function prefilterPass(text, minScore = 2) {
-  const t = (text || "").toLowerCase();
-  if (t.length < 40) return false;
+// Title-level exclusions (checked with word boundaries to avoid false positives like "Sales Enablement Trainer")
+const EXCLUDED_TITLE_PATTERNS = [
+  /\b(?:sales\s+rep(?:resentative)?|account\s+executive|business\s+development|bdr|sdr)\b/i,
+  /\b(?:medical\s+billing|medical\s+coder|nurse|nursing|physician|pharmacist)\b/i,
+  /\b(?:call\s+cent(?:er|re)|telecaller|telemarketer|customer\s+support\s+rep)\b/i,
+  /\b(?:software\s+engineer|backend\s+developer|devops|full\s*stack\s+developer|security\s+engineer)\b/i,
+  /\b(?:warehouse|forklift|truck\s+driver|delivery\s+driver|security\s+guard|electrician|plumber)\b/i,
+  /\b(?:accountant|bookkeeper|tax\s+associate|auditor)\b/i,
+  /\b(?:recruiter|talent\s+acquisition\s+specialist)\b/i,
+  /\b(?:product\s+designer|graphic\s+designer|ui\s*\/\s*ux\s+designer|interior\s+designer)\b/i,
+];
+
+// Body-level negative phrases — only strictly unambiguous non-L&D job indicators
+const BODY_HARD_NEGATIVE = [
+  "cold calling", "outbound calling", "door to door", "patient care", "clinical bedside",
+  "commercial driving license", "cdl-a", "cdl class a", "hvac technician", "lawn care",
+];
+
+function isTitleExcluded(title) {
+  const t = (title || "").trim();
+  return EXCLUDED_TITLE_PATTERNS.some(re => re.test(t));
+}
+
+function prefilterPass(job) {
+  const title = job.title || "";
+  if (isTitleExcluded(title)) return false;
+
+  const text = `${title} ${job.location || ""} ${job.description || ""}`.toLowerCase();
+  if (text.length < 40) return false;
+
   let score = 0;
-  for (const kw of STRONG_POSITIVE) if (t.includes(kw)) score += 2;
-  for (const kw of HARD_NEGATIVE) if (t.includes(kw)) score -= 3;
-  return score >= minScore;
+  for (const kw of STRONG_POSITIVE) {
+    if (text.includes(kw)) score += 2;
+  }
+  for (const neg of BODY_HARD_NEGATIVE) {
+    if (text.includes(neg)) score -= 4;
+  }
+
+  return score >= 2;
 }
 
 function thinTextWorthAnalyzing(title) {
   const t = (title || "").toLowerCase().trim();
   if (t.length < 8) return false;
-  const JUNK = ["read more","apply now","apply here","view all","see all","login",
-    "sign in","register","subscribe","newsletter","cookie","privacy","terms",
-    "contact us","about us","home","next","previous","load more","search jobs",
-    "search for jobs","saved jobs","jobs expiring","expiring soon","browse",
-    "filter","sort by","all jobs","my account","create account","post a job",
-    "advertise","help","faq","sitemap","back to"];
-  for (const j of JUNK) if (t === j || t.startsWith(j) || t.includes(j)) return false;
-  for (const kw of HARD_NEGATIVE) if (t.includes(kw)) return false;
-  const TOO_SENIOR = ["chief learning officer","vice president"," vp ","svp ",
-    "executive director","head of department"];
-  for (const s of TOO_SENIOR) if (t.includes(s)) return false;
-  const DOMAIN = ["learning","training","instructional","elearning","e-learning",
-    "curriculum","course","education","lms","edtech","scorm","xapi","storyline",
-    "captivate","articulate","design"];
-  if (!DOMAIN.some(d => t.includes(d))) return false;
-  return true;
+  if (isTitleExcluded(title)) return false;
+
+  const JUNK = [
+    "read more", "apply now", "apply here", "view all", "see all", "login",
+    "sign in", "register", "subscribe", "newsletter", "cookie", "privacy", "terms",
+    "contact us", "about us", "home", "next", "previous", "load more", "search jobs",
+    "search for jobs", "saved jobs", "jobs expiring", "expiring soon", "browse",
+    "filter", "sort by", "all jobs", "my account", "create account", "post a job",
+  ];
+  for (const j of JUNK) {
+    if (t === j || t.startsWith(j)) return false;
+  }
+
+  const TOO_SENIOR = [
+    "chief learning officer", "vice president", "executive director", "head of department",
+    "vp ", "svp ",
+  ];
+  for (const s of TOO_SENIOR) {
+    if (t.includes(s)) return false;
+  }
+
+  // Require qualified domain indicator — not generic "design" alone
+  const DOMAIN = [
+    "learning", "training", "instructional", "elearning", "e-learning",
+    "curriculum", "course", "education", "lms", "edtech", "scorm", "xapi",
+    "storyline", "captivate", "articulate", "instructional design",
+    "learning experience", "learning design",
+  ];
+  return DOMAIN.some(d => t.includes(d));
 }
 
 function stripHtml(s) {
@@ -203,105 +237,144 @@ function stripHtml(s) {
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"').replace(/&#0?39;/gi, "'")
+    .replace(/&#8217;/gi, "'").replace(/&#8220;|&#8221;/gi, '"')
     .replace(/\s+/g, " ")
     .trim();
 }
 
-// Decode the handful of HTML entities that show up inside URLs.
 function decodeHtmlUrl(s) {
   return (s || "")
-    .replace(/&amp;/g, "&").replace(/&#38;/g, "&")
-    .replace(/&quot;/g, '"').replace(/&#34;/g, '"')
-    .replace(/&#39;/g, "'").replace(/&#x2f;/gi, "/");
+    .replace(/&amp;/gi, "&").replace(/&#38;/g, "&")
+    .replace(/&quot;/gi, '"').replace(/&#34;/g, '"')
+    .replace(/&#39;/gi, "'").replace(/&#x2f;/gi, "/");
 }
 
-// Pull the "real" destination out of an aggregator page body. Adzuna's land/ad and
-// details pages usually redirect via meta-refresh or JS, or link out via a land/ad
-// href or JSON-LD — none of which an HTTP-redirect follower can see. Order matters.
-function extractRedirectFromHtml(html, baseUrl) {
-  if (!html) return "";
-  const abs = (u) => { try { return new URL(decodeHtmlUrl(u), baseUrl).href; } catch { return ""; } };
-  const offAgg = (u) => u && !/adzuna\.|jooble\.org/i.test(u);
-
-  // 1. <meta http-equiv="refresh" content="0; url=...">
-  let m = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^"']*url=([^"'>\s]+)/i);
-  if (m) { const u = abs(m[1]); if (offAgg(u)) return u; }
-
-  // 2. JS redirect: window.location = "..." / location.replace("...")
-  m = html.match(/(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']/i)
-    || html.match(/location\.replace\(\s*["']([^"']+)["']\s*\)/i);
-  if (m) { const u = abs(m[1]); if (offAgg(u)) return u; }
-
-  // 3. A land/ad tracking link on the page (details page → follow it next hop).
-  m = html.match(/href=["']([^"']*\/(?:jobs\/)?land\/ad\/\d+[^"']*)["']/i);
-  if (m) { const u = abs(m[1]); if (u) return u; }
-
-  // 4. JSON-LD JobPosting carrying an external url / applyUrl.
-  const lds = html.match(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || [];
-  for (const block of lds) {
-    try {
-      const parsed = JSON.parse(block.replace(/<script[^>]*>/i, "").replace(/<\/script>/i, "").trim());
-      for (const o of (Array.isArray(parsed) ? parsed : [parsed])) {
-        const cand = o && (o.url || o.sameAs || (o.hiringOrganization && o.hiringOrganization.sameAs)
-          || (o.potentialAction && o.potentialAction.target && (o.potentialAction.target.urlTemplate || o.potentialAction.target.url)));
-        if (typeof cand === "string" && offAgg(cand)) return cand;
-      }
-    } catch {}
+function sameDomain(a, b) {
+  try {
+    return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase();
+  } catch {
+    return true;
   }
-  return "";
 }
 
-// Resolve an aggregator link to its true external destination. Follows HTTP
-// redirects AND reads the page body for meta/JS/link redirects. Falls back to the
-// original URL on any timeout/error so a job is never lost.
-async function resolveFinalUrl(url, maxHops = 8) {
-  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
-  let current = url;
+function resolveRelative(maybeRelative, base) {
+  try {
+    return new URL(decodeHtmlUrl(maybeRelative), base).toString();
+  } catch {
+    return null;
+  }
+}
+
+// =============================================================================
+// DIRECT APPLY LINK RESOLUTION
+// =============================================================================
+async function resolveDirectApplyUrl(pageUrl, maxHops = 6) {
+  if (!pageUrl) return null;
+  const isAggregator = (u) => /adzuna\.|jooble\.org|linkedin\.com/i.test(u);
+  if (!isAggregator(pageUrl)) return pageUrl;
+
+  let current = pageUrl;
   for (let hop = 0; hop < maxHops; hop++) {
     let res;
     try {
       res = await fetch(current, {
         method: "GET",
-        redirect: "manual",
-        headers: { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml" },
-        signal: AbortSignal.timeout(9000),
+        redirect: "follow",
+        headers: {
+          "User-Agent": BROWSER_UA,
+          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
     } catch {
-      return current;
+      return !isAggregator(current) ? current : null;
     }
-    if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get("location");
-      if (!loc) return current;
-      try { current = new URL(loc, current).href; } catch { return current; }
-      continue;
+
+    const finalUrl = res.url || current;
+    if (finalUrl !== current && !sameDomain(finalUrl, pageUrl) && !isAggregator(finalUrl)) {
+      return finalUrl;
     }
-    // 2xx and still on an aggregator domain — look inside the page for the real link.
-    if (res.status >= 200 && res.status < 300 && /adzuna\.|jooble\.org/i.test(current)) {
-      let html = "";
-      try { html = await res.text(); } catch { return current; }
-      const next = extractRedirectFromHtml(html, current);
-      if (next && next !== current) { current = next; continue; }
-      return current;
+
+    let html = "";
+    try {
+      html = await res.text();
+    } catch {
+      return !isAggregator(finalUrl) ? finalUrl : null;
     }
-    return current;
+
+    // 1. <meta http-equiv="refresh" content="...url=...">
+    const metaRefresh = html.match(/<meta[^>]+http-equiv=["']?refresh["']?[^>]+content=["'][^;]+;\s*url=([^"'>\s]+)/i)
+      || html.match(/<meta[^>]+content=["'][^;]+;\s*url=([^"'>\s]+)["'][^>]+http-equiv=["']?refresh["']?/i);
+    if (metaRefresh) {
+      const u = resolveRelative(metaRefresh[1], current);
+      if (u && !sameDomain(u, pageUrl) && !isAggregator(u)) return u;
+      if (u && u !== current) { current = u; continue; }
+    }
+
+    // 2. JS redirect: location.href = "..."
+    const jsRedir = html.match(/(?:window\.)?location(?:\.href|\.replace)\s*=\s*["']([^"']+)["']/i);
+    if (jsRedir) {
+      const u = resolveRelative(jsRedir[1], current);
+      if (u && !sameDomain(u, pageUrl) && !isAggregator(u)) return u;
+      if (u && u !== current) { current = u; continue; }
+    }
+
+    // 3. Aggregator tracking hop (/land/ad/ or /track/)
+    const landMatch = html.match(/href=["']([^"']*(?:land\/ad|redirect|track)[^"']*)["']/i);
+    if (landMatch) {
+      const u = resolveRelative(landMatch[1], current);
+      if (u && u !== current) { current = u; continue; }
+    }
+
+    // 4. JSON-LD JobPosting url
+    const lds = html.match(/<script[^>]+application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi) || [];
+    for (const block of lds) {
+      try {
+        const json = block.replace(/<script[^>]*>/i, "").replace(/<\/script>/i, "").trim();
+        const parsed = JSON.parse(json);
+        const list = Array.isArray(parsed) ? parsed : [parsed];
+        for (const item of list) {
+          const cand = item && (item.url || item.sameAs || item.potentialAction?.target?.url);
+          if (typeof cand === "string" && !sameDomain(cand, pageUrl) && !isAggregator(cand)) {
+            return cand;
+          }
+        }
+      } catch {}
+    }
+
+    if (!isAggregator(finalUrl)) return finalUrl;
+    return null;
   }
-  return current;
+
+  return !isAggregator(current) ? current : null;
 }
 
 // =============================================================================
-// CLOUDFLARE KV via REST API
+// CLOUDFLARE KV REST CLIENT (Fail-Open on Reads)
 // =============================================================================
 const KV_BASE = () => `https://api.cloudflare.com/client/v4/accounts/${ENV.CF_ACCOUNT_ID}/storage/kv/namespaces/${ENV.CF_KV_NAMESPACE_ID}`;
 const KV_HEADERS = () => ({ "Authorization": `Bearer ${ENV.CF_API_TOKEN}` });
 
 async function kvGet(key) {
-  const res = await fetch(`${KV_BASE()}/values/${encodeURIComponent(key)}`, { headers: KV_HEADERS() });
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`KV get ${key} -> ${res.status}`);
-  return await res.text();
+  try {
+    const res = await fetch(`${KV_BASE()}/values/${encodeURIComponent(key)}`, {
+      headers: KV_HEADERS(),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) {
+      console.warn(`KV read warning for ${key}: HTTP ${res.status}`);
+      return null; // Fail-open: treat as not seen to prevent dropping real jobs
+    }
+    return await res.text();
+  } catch (e) {
+    console.warn(`KV read error for ${key}: ${e.message}`);
+    return null; // Fail-open
+  }
 }
 
 async function kvPut(key, value, ttlSeconds) {
@@ -310,6 +383,7 @@ async function kvPut(key, value, ttlSeconds) {
     method: "PUT",
     headers: { ...KV_HEADERS(), "Content-Type": "text/plain" },
     body: typeof value === "string" ? value : JSON.stringify(value),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!res.ok) throw new Error(`KV put ${key} -> ${res.status}`);
 }
@@ -317,12 +391,31 @@ async function kvPut(key, value, ttlSeconds) {
 // =============================================================================
 // DEDUP KEYS
 // =============================================================================
-import { createHash } from "node:crypto";
-function sha1Hex(s) { return createHash("sha1").update(s).digest("hex"); }
+function sha1Hex(s) {
+  return createHash("sha1").update(s).digest("hex");
+}
+
+function cleanTrackingParams(rawUrl) {
+  if (!rawUrl) return "";
+  try {
+    if (typeof URL !== "undefined") {
+      const u = new URL(rawUrl);
+      const tracking = [
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "gh_src", "ref", "source", "fbclid", "gclid", "mc_cid", "mc_eid",
+      ];
+      for (const p of tracking) u.searchParams.delete(p);
+      return u.toString();
+    }
+  } catch {}
+  return rawUrl.replace(/([?&])(?:utm_[a-z]+|gh_src|fbclid|gclid|mc_[ce]id|ref)=[^&#]*/gi, "$1")
+    .replace(/[?&]$/, "")
+    .replace(/[?&]&+/g, (m) => m[0]);
+}
 
 function seenKey(url) {
-  const base = (url || "").split("?")[0];
-  return "seen:" + sha1Hex(base).slice(0, 24);
+  const cleaned = cleanTrackingParams(url);
+  return "seen:" + sha1Hex(cleaned).slice(0, 24);
 }
 
 function normalizeForFingerprint(s) {
@@ -332,22 +425,67 @@ function normalizeForFingerprint(s) {
     .replace(/\bengg?\.?\b/g, "engineer")
     .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 }
+
 function fingerprintKey(job) {
   const company = normalizeForFingerprint(job.company).split(" ").slice(0, 2).join(" ");
   const title = normalizeForFingerprint(job.title);
   return "fp:" + sha1Hex(`${company}|${title}`).slice(0, 24);
 }
 
+function normalizePostedDate(raw) {
+  if (!raw) return "";
+  const t = Date.parse(raw);
+  if (!isNaN(t)) return new Date(t).toISOString();
+  const lower = String(raw).toLowerCase().trim();
+  const now = Date.now();
+  const hrMatch = lower.match(/(\d+)\s*(?:hour|hr)/);
+  if (hrMatch) return new Date(now - parseInt(hrMatch[1], 10) * 3600000).toISOString();
+  const dayMatch = lower.match(/(\d+)\s*(?:day|d)/);
+  if (dayMatch) return new Date(now - parseInt(dayMatch[1], 10) * 86400000).toISOString();
+  const wkMatch = lower.match(/(\d+)\s*(?:week|wk)/);
+  if (wkMatch) return new Date(now - parseInt(wkMatch[1], 10) * 7 * 86400000).toISOString();
+  const moMatch = lower.match(/(\d+)\s*(?:month|mo)/);
+  if (moMatch) return new Date(now - parseInt(moMatch[1], 10) * 30 * 86400000).toISOString();
+  if (lower.includes("yesterday")) return new Date(now - 86400000).toISOString();
+  if (lower.includes("today") || lower.includes("just now")) return new Date(now).toISOString();
+  return raw;
+}
+
+async function cleanupStaleDashboardJobs() {
+  if (!ENV.CAREER_ANALYZER_URL) return;
+  try {
+    const dashUrl = ENV.CAREER_ANALYZER_URL.replace("career-intelligence-api-niyas", "career-dashboard-niyas");
+    const res = await fetch(`${dashUrl}/api/cleanup-stale?key=niyas-2026&days=15`, {
+      method: "POST",
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.deleted > 0) {
+        console.log(`[maintenance] Auto-deleted ${data.deleted} unattended jobs older than 15 days.`);
+      }
+    }
+  } catch (e) {
+    // Non-fatal background maintenance
+  }
+}
+
 // =============================================================================
-// SOURCE ADAPTERS — Greenhouse, Lever, Ashby, Adzuna
+// SOURCE ADAPTERS
 // =============================================================================
+
+// ---- Greenhouse ATS ----
 async function fetchGreenhouse(token, report) {
   try {
-    const res = await fetch(`https://boards-api.greenhouse.io/v1/boards/${token}/jobs?content=true`);
+    const res = await fetch(`https://boards-api.greenhouse.io/v1/boards/${token}/jobs?content=true`, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) { report.push(`greenhouse:${token} -> HTTP ${res.status}`); return []; }
     const data = await res.json();
     const jobs = (data.jobs || []).map(j => ({
-      title: j.title || "",
+      title: stripHtml(j.title || ""),
       company: token,
       location: j.location?.name || "",
       url: j.absolute_url || "",
@@ -359,13 +497,17 @@ async function fetchGreenhouse(token, report) {
   } catch (e) { report.push(`greenhouse:${token} -> ERR ${e.message}`); return []; }
 }
 
+// ---- Lever ATS ----
 async function fetchLever(token, report) {
   try {
-    const res = await fetch(`https://api.lever.co/v0/postings/${token}?mode=json`);
+    const res = await fetch(`https://api.lever.co/v0/postings/${token}?mode=json`, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) { report.push(`lever:${token} -> HTTP ${res.status}`); return []; }
     const data = await res.json();
     const jobs = (data || []).map(j => ({
-      title: j.text || "",
+      title: stripHtml(j.text || ""),
       company: token,
       location: j.categories?.location || "",
       url: j.hostedUrl || "",
@@ -377,13 +519,17 @@ async function fetchLever(token, report) {
   } catch (e) { report.push(`lever:${token} -> ERR ${e.message}`); return []; }
 }
 
+// ---- Ashby ATS ----
 async function fetchAshby(token, report) {
   try {
-    const res = await fetch(`https://api.ashbyhq.com/posting-api/job-board/${token}?includeCompensation=true`);
+    const res = await fetch(`https://api.ashbyhq.com/posting-api/job-board/${token}?includeCompensation=true`, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) { report.push(`ashby:${token} -> HTTP ${res.status}`); return []; }
     const data = await res.json();
     const jobs = (data.jobs || []).map(j => ({
-      title: j.title || "",
+      title: stripHtml(j.title || ""),
       company: token,
       location: j.location || (j.address?.postalAddress?.addressLocality) || "",
       url: j.jobUrl || j.applyUrl || "",
@@ -395,25 +541,32 @@ async function fetchAshby(token, report) {
   } catch (e) { report.push(`ashby:${token} -> ERR ${e.message}`); return []; }
 }
 
+// ---- Adzuna ----
 async function fetchAdzuna(country, query, report) {
   if (!ENV.ADZUNA_APP_ID || !ENV.ADZUNA_APP_KEY) return [];
   const params = new URLSearchParams({
-    app_id: ENV.ADZUNA_APP_ID, app_key: ENV.ADZUNA_APP_KEY,
-    what: query, results_per_page: String(CONFIG.ADZUNA_RESULTS_PER_CALL),
+    app_id: ENV.ADZUNA_APP_ID,
+    app_key: ENV.ADZUNA_APP_KEY,
+    what: query,
+    results_per_page: String(CONFIG.ADZUNA_RESULTS_PER_CALL),
     max_days_old: String(CONFIG.ADZUNA_MAX_DAYS_OLD),
     "content-type": "application/json",
   });
   const url = `https://api.adzuna.com/v1/api/jobs/${country}/search/1?${params}`;
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) { report.push(`adzuna:${country}:"${query}" -> HTTP ${res.status}`); return []; }
     const data = await res.json();
     const jobs = (data.results || []).map(j => ({
-      title: j.title || "",
-      company: `adzuna:${country}`,
+      title: stripHtml(j.title || ""),
+      // Fix: Use actual employer name instead of hardcoded adzuna:country to prevent duplicate collisions
+      company: stripHtml(j.company?.display_name || "Adzuna"),
       location: j.location?.display_name || (j.location?.area || []).slice(-2).join(", ") || "",
       url: j.redirect_url || "",
-      description: (j.company?.display_name ? `Company: ${j.company.display_name}\n\n` : "") + stripHtml(j.description || ""),
+      description: stripHtml(j.description || ""),
       postedDate: j.created || "",
     }));
     report.push(`adzuna:${country}:"${query}" -> ${jobs.length}`);
@@ -442,39 +595,58 @@ async function pickAdzunaSlice() {
   return slice;
 }
 
-async function fetchJooble(location, query, report) {
+// ---- Jooble (Optimized with bundled keywords & browser headers) ----
+async function fetchJooble(location, report) {
   if (!ENV.JOOBLE_API_KEY) return [];
   try {
     const res = await fetch(`https://jooble.org/api/${ENV.JOOBLE_API_KEY}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": BROWSER_UA,
+        "Accept": "application/json",
+      },
       body: JSON.stringify({
-        keywords: query,
+        keywords: CONFIG.JOOBLE_COMBINED_KEYWORDS,
         location,
         page: "1",
         ResultOnPage: CONFIG.JOOBLE_RESULTS_PER_CALL,
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) { report.push(`jooble:${location}:"${query}" -> HTTP ${res.status}`); return []; }
-    const data = await res.json();
+
+    const bodyText = await res.text();
+    if (!res.ok) { report.push(`jooble:${location} -> HTTP ${res.status}`); return []; }
+
+    let data;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      report.push(`jooble:${location} -> non-JSON response`);
+      return [];
+    }
+
+    if (data.errors || (!Array.isArray(data.jobs) && data.jobs !== undefined)) {
+      report.push(`jooble:${location} -> API error: ${JSON.stringify(data.errors || data).slice(0, 80)}`);
+      return [];
+    }
+
     const jobs = (data.jobs || []).map(j => ({
-      title: j.title || "",
-      company: j.company || "",
+      title: stripHtml(j.title || ""),
+      company: stripHtml(j.company || ""),
       location: j.location || location,
       url: j.link || "",
       description: stripHtml(j.snippet || ""),
       postedDate: j.updated || "",
-      thinText: true, // Jooble returns short snippets — filter by title, not body.
+      thinText: true,
     }));
-    report.push(`jooble:${location}:"${query}" -> ${jobs.length}`);
+    report.push(`jooble:${location} -> ${jobs.length}`);
     return jobs;
-  } catch (e) { report.push(`jooble:${location}:"${query}" -> ERR ${e.message}`); return []; }
+  } catch (e) { report.push(`jooble:${location} -> ERR ${e.message}`); return []; }
 }
 
 async function pickJoobleSlice() {
   const locations = CONFIG.JOOBLE_LOCATIONS;
-  const queries = CONFIG.ADZUNA_QUERIES; // reuse the same L&D query set
-  const total = locations.length * queries.length;
   let cursor = 0;
   try {
     const stored = await kvGet("discovery:jooble_cursor");
@@ -482,26 +654,120 @@ async function pickJoobleSlice() {
   } catch {}
   const slice = [];
   for (let i = 0; i < CONFIG.JOOBLE_CALLS_PER_RUN; i++) {
-    const idx = (cursor + i) % total;
-    const loc = locations[idx % locations.length];
-    const q = queries[Math.floor(idx / locations.length) % queries.length];
-    slice.push({ location: loc, query: q });
+    const idx = (cursor + i) % locations.length;
+    slice.push(locations[idx]);
   }
-  const newCursor = (cursor + CONFIG.JOOBLE_CALLS_PER_RUN) % total;
+  const newCursor = (cursor + CONFIG.JOOBLE_CALLS_PER_RUN) % locations.length;
   try { await kvPut("discovery:jooble_cursor", String(newCursor)); } catch {}
   return slice;
 }
 
+// ---- LinkedIn Jobs (Public Guest API — No Key Required) ----
+async function searchLinkedIn(keywordsQuery, location) {
+  const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?keywords=${encodeURIComponent(keywordsQuery)}&location=${encodeURIComponent(location)}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const html = await res.text();
+  const jobs = [];
+  const linkMatches = [...html.matchAll(/<a[^>]*class=["'][^"']*base-card__full-link[^"']*["'][^>]*href=["']([^"']+)["']/gi)];
+  const titleMatches = [...html.matchAll(/<h3[^>]*class=["'][^"']*base-search-card__title[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/h3>/gi)];
+  const compMatches = [...html.matchAll(/<h4[^>]*class=["'][^"']*base-search-card__subtitle[^"']*["'][^>]*>[\s\S]*?<a[^>]*>\s*([\s\S]*?)\s*<\/a>/gi)];
+  const locMatches = [...html.matchAll(/<span[^>]*class=["'][^"']*job-search-card__location[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/span>/gi)];
+
+  for (let i = 0; i < linkMatches.length; i++) {
+    const rawLink = linkMatches[i][1];
+    const idMatch = rawLink.match(/-(\d+)(?:\?|$)/);
+    if (!idMatch) continue;
+
+    const jobId = idMatch[1];
+    const cleanLink = `https://www.linkedin.com/jobs/view/${jobId}`;
+    const title = titleMatches[i] ? stripHtml(titleMatches[i][1]) : "";
+    const company = compMatches[i] ? stripHtml(compMatches[i][1]) : "";
+    const loc = locMatches[i] ? stripHtml(locMatches[i][1]) : location;
+
+    jobs.push({ id: jobId, title, company, location: loc, url: cleanLink });
+  }
+
+  return jobs;
+}
+
+async function fetchLinkedInDetail(jobId) {
+  const url = `https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/${jobId}`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  const html = await res.text();
+  const descMatch = html.match(/<div[^>]*class=["'][^"']*show-more-less-html__markup[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+  const snippet = descMatch ? stripHtml(descMatch[1]).slice(0, 5000) : "";
+
+  const dateMatch = html.match(/<span[^>]*class=["'][^"']*posted-time-ago__text[^"']*["'][^>]*>\s*([\s\S]*?)\s*<\/span>/i);
+  const postedDate = dateMatch ? stripHtml(dateMatch[1]) : "";
+
+  return { snippet, postedDate };
+}
+
+// ---- JSearch (Google for Jobs via RapidAPI — Optional) ----
+async function fetchJSearch(query, location, report) {
+  if (!ENV.RAPIDAPI_KEY) return [];
+  const fullQuery = `${query} in ${location}`;
+  const url = `https://jsearch.p.rapidapi.com/search?query=${encodeURIComponent(fullQuery)}&page=1&num_pages=1&date_posted=all`;
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "x-rapidapi-key": ENV.RAPIDAPI_KEY,
+        "x-rapidapi-host": "jsearch.p.rapidapi.com",
+        "User-Agent": BROWSER_UA,
+      },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) { report.push(`jsearch:${location} -> HTTP ${res.status}`); return []; }
+    const data = await res.json();
+    const rawList = Array.isArray(data.data) ? data.data : [];
+    const jobs = rawList.map(item => ({
+      title: stripHtml(item.job_title || ""),
+      company: stripHtml(item.employer_name || ""),
+      location: item.job_city ? `${item.job_city}, ${item.job_country || ""}` : location,
+      url: item.job_apply_link || item.job_google_link || "",
+      description: stripHtml(item.job_description || "").slice(0, 5000),
+      postedDate: item.job_posted_at_datetime_utc || "",
+      directApplyUrl: item.job_apply_link || "",
+    }));
+    report.push(`jsearch:${location} -> ${jobs.length}`);
+    return jobs;
+  } catch (e) { report.push(`jsearch:${location} -> ERR ${e.message}`); return []; }
+}
+
+// ---- Jobicy (Remote) ----
 async function fetchJobicy(params, report) {
   const label = params.industry ? `industry=${params.industry}` : `tag=${params.tag}`;
   const qs = new URLSearchParams({ count: String(CONFIG.JOBICY_RESULTS_PER_CALL), ...params });
   try {
-    const res = await fetch(`https://jobicy.com/api/v2/remote-jobs?${qs}`);
+    const res = await fetch(`https://jobicy.com/api/v2/remote-jobs?${qs}`, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) { report.push(`jobicy:${label} -> HTTP ${res.status}`); return []; }
     const data = await res.json();
     const jobs = (data.jobs || []).map(j => ({
-      title: j.jobTitle || "",
-      company: j.companyName || "",
+      title: stripHtml(j.jobTitle || ""),
+      company: stripHtml(j.companyName || ""),
       location: j.jobGeo || "Remote",
       url: j.url || "",
       description: stripHtml(j.jobDescription || j.jobExcerpt || ""),
@@ -512,11 +778,13 @@ async function fetchJobicy(params, report) {
   } catch (e) { report.push(`jobicy:${label} -> ERR ${e.message}`); return []; }
 }
 
+// ---- Himalayas (Remote) ----
 async function fetchHimalayas(query, report) {
-  // Field names mapped defensively (title/company/url variants) — if a run returns
-  // counts but nothing passes, check the raw shape and adjust the field names.
   try {
-    const res = await fetch(`https://himalayas.app/jobs/api/search?keywords=${encodeURIComponent(query)}&limit=20`);
+    const res = await fetch(`https://himalayas.app/jobs/api/search?keywords=${encodeURIComponent(query)}&limit=20`, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
     if (!res.ok) { report.push(`himalayas:"${query}" -> HTTP ${res.status}`); return []; }
     const data = await res.json();
     const arr = data.jobs || data.data || [];
@@ -526,8 +794,8 @@ async function fetchHimalayas(query, report) {
       const loc = Array.isArray(j.locationRestrictions) && j.locationRestrictions.length
         ? j.locationRestrictions.join(", ") : "Remote";
       return {
-        title: j.title || j.jobTitle || "",
-        company: j.companyName || j.company || "",
+        title: stripHtml(j.title || j.jobTitle || ""),
+        company: stripHtml(j.companyName || j.company || ""),
         location: loc,
         url: j.applicationLink || j.url || j.guid || "",
         description: stripHtml(j.description || j.excerpt || ""),
@@ -572,30 +840,39 @@ function interleaveBySource(jobs) {
 async function analyzeAndSave(job, report) {
   const description = job.description || "";
   const content = `Job Title: ${job.title}\nCompany: ${job.company}\nLocation: ${job.location}\n\n${description}`.slice(0, 12000);
-  const payload = { content, url: job.url, title: job.title, postedDate: job.postedDate || "", directApplyUrl: job.directApplyUrl || "" };
+  const payload = {
+    content,
+    url: job.url,
+    title: job.title,
+    postedDate: normalizePostedDate(job.postedDate) || "",
+    directApplyUrl: job.directApplyUrl || "",
+  };
 
   const MAX_TRIES = 3;
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     try {
       const res = await fetch(ENV.CAREER_ANALYZER_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "User-Agent": BROWSER_UA },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000),
       });
       if (res.ok) return true;
+
       let bodySnippet = "";
       try { bodySnippet = (await res.text()).slice(0, 200); } catch {}
       const transient = res.status === 502 || res.status === 503 || res.status === 429
         || /503|high demand|RESOURCE_EXHAUSTED|overload/i.test(bodySnippet);
+
       if (transient && attempt < MAX_TRIES) {
-        await new Promise(r => setTimeout(r, attempt * 1500));
+        await sleep(attempt * 1500);
         continue;
       }
-      report.push(`analyze FAIL ${res.status} (try ${attempt}) :: ${bodySnippet.slice(0, 120)} :: ${job.title.slice(0, 28)}`);
+      report.push(`analyzer -> HTTP ${res.status}: ${bodySnippet}`);
       return false;
     } catch (e) {
-      if (attempt < MAX_TRIES) { await new Promise(r => setTimeout(r, attempt * 1500)); continue; }
-      report.push(`analyze ERR ${e.message}: ${job.title.slice(0, 40)}`);
+      if (attempt < MAX_TRIES) { await sleep(attempt * 1500); continue; }
+      report.push(`analyzer -> ERR: ${e.message}`);
       return false;
     }
   }
@@ -606,37 +883,116 @@ async function analyzeAndSave(job, report) {
 // MAIN
 // =============================================================================
 async function main() {
-  requireEnv(["CF_ACCOUNT_ID","CF_API_TOKEN","CF_KV_NAMESPACE_ID","CAREER_ANALYZER_URL"]);
+  requireEnv(["CF_ACCOUNT_ID", "CF_API_TOKEN", "CF_KV_NAMESPACE_ID", "CAREER_ANALYZER_URL"]);
   const report = [];
   let collected = [];
 
+  // Auto-cleanup unattended jobs older than 15 days from the dashboard KV
+  await cleanupStaleDashboardJobs();
+
   // ---- 1. Collect from all sources ------------------------------------------
-  for (const t of CONFIG.ATS.greenhouse) collected.push(...await fetchGreenhouse(t, report));
-  for (const t of CONFIG.ATS.lever) collected.push(...await fetchLever(t, report));
-  for (const t of CONFIG.ATS.ashby) collected.push(...await fetchAshby(t, report));
+  for (const t of CONFIG.ATS.greenhouse) {
+    collected.push(...await fetchGreenhouse(t, report));
+    await sleep(60);
+  }
+  for (const t of CONFIG.ATS.lever) {
+    collected.push(...await fetchLever(t, report));
+  }
+  for (const t of CONFIG.ATS.ashby) {
+    collected.push(...await fetchAshby(t, report));
+  }
+
+  // Adzuna
   if (CONFIG.ADZUNA_ENABLED && ENV.ADZUNA_APP_ID && ENV.ADZUNA_APP_KEY) {
-    // Rotation across the full country×query matrix — different slice each run.
     const slice = await pickAdzunaSlice();
     for (const { country, query } of slice) {
       collected.push(...await fetchAdzuna(country, query, report));
+      await sleep(150);
     }
   } else if (CONFIG.ADZUNA_ENABLED) {
     report.push("adzuna -> skipped (ADZUNA_APP_ID / ADZUNA_APP_KEY not set)");
   }
+
+  // Jooble (bundled)
   if (CONFIG.JOOBLE_ENABLED && ENV.JOOBLE_API_KEY) {
-    const jslice = await pickJoobleSlice();
-    for (const { location, query } of jslice) {
-      collected.push(...await fetchJooble(location, query, report));
+    const locations = await pickJoobleSlice();
+    for (const location of locations) {
+      collected.push(...await fetchJooble(location, report));
+      await sleep(250);
     }
   } else if (CONFIG.JOOBLE_ENABLED) {
     report.push("jooble -> skipped (JOOBLE_API_KEY not set)");
   }
+
+  // LinkedIn Jobs (Public Guest API)
+  if (CONFIG.LINKEDIN_ENABLED) {
+    let linkedInFound = 0;
+    for (const location of CONFIG.LINKEDIN_LOCATIONS) {
+      for (const query of CONFIG.LINKEDIN_QUERIES) {
+        let cards = [];
+        try {
+          cards = await searchLinkedIn(query, location);
+        } catch (e) {
+          report.push(`linkedin:"${query}" in ${location} -> ERR ${e.message}`);
+          continue;
+        }
+
+        for (const card of cards.slice(0, CONFIG.LINKEDIN_MAX_PER_QUERY)) {
+          // Pre-check KV before fetching detail page
+          const sk = seenKey(card.url);
+          const alreadySeen = await kvGet(sk);
+          if (alreadySeen) continue;
+
+          let detail = { snippet: "", postedDate: "" };
+          try {
+            detail = await fetchLinkedInDetail(card.id);
+            await sleep(250); // polite crawl delay
+          } catch {
+            detail.snippet = card.title;
+          }
+
+          collected.push({
+            title: card.title,
+            company: card.company,
+            location: card.location,
+            url: card.url,
+            description: detail.snippet || card.title,
+            postedDate: detail.postedDate || "",
+          });
+          linkedInFound++;
+        }
+        await sleep(350);
+      }
+    }
+    report.push(`linkedin -> ${linkedInFound} postings harvested`);
+  }
+
+  // JSearch (Google for Jobs via RapidAPI)
+  if (CONFIG.JSEARCH_ENABLED && ENV.RAPIDAPI_KEY) {
+    for (const location of CONFIG.JSEARCH_LOCATIONS) {
+      for (const query of CONFIG.JSEARCH_QUERIES) {
+        collected.push(...await fetchJSearch(query, location, report));
+        await sleep(200);
+      }
+    }
+  }
+
+  // Jobicy (Remote)
   if (CONFIG.JOBICY_ENABLED) {
-    for (const p of CONFIG.JOBICY_CALLS) collected.push(...await fetchJobicy(p, report));
+    for (const p of CONFIG.JOBICY_CALLS) {
+      collected.push(...await fetchJobicy(p, report));
+      await sleep(150);
+    }
   }
+
+  // Himalayas (Remote)
   if (CONFIG.HIMALAYAS_ENABLED) {
-    for (const q of CONFIG.HIMALAYAS_QUERIES) collected.push(...await fetchHimalayas(q, report));
+    for (const q of CONFIG.HIMALAYAS_QUERIES) {
+      collected.push(...await fetchHimalayas(q, report));
+      await sleep(150);
+    }
   }
+
   report.push(`--- collected ${collected.length} raw postings ---`);
 
   // ---- 2. Balance via round-robin ------------------------------------------
@@ -645,7 +1001,10 @@ async function main() {
   // ---- 3. Filter + dedup + analyze -----------------------------------------
   let analyzed = 0, passed = 0, dupes = 0, attempts = 0;
   const srcStats = {};
-  const bump = (c, field) => { const k = (c||'?').toLowerCase(); (srcStats[k] = srcStats[k] || {seen:0,filtered:0,analyzed:0})[field]++; };
+  const bump = (c, field) => {
+    const k = (c || "?").toLowerCase();
+    (srcStats[k] = srcStats[k] || { seen: 0, filtered: 0, analyzed: 0 })[field]++;
+  };
 
   for (const job of collected) {
     if (attempts >= CONFIG.MAX_ANALYZE_PER_RUN) {
@@ -653,40 +1012,57 @@ async function main() {
       break;
     }
     if (!job.url) continue;
-    bump(job.company, 'seen');
-    const blob = `${job.title} ${job.location} ${job.description}`;
+    bump(job.company, "seen");
+
     if (job.thinText) {
-      if (!thinTextWorthAnalyzing(job.title)) { bump(job.company, 'filtered'); continue; }
+      if (!thinTextWorthAnalyzing(job.title)) { bump(job.company, "filtered"); continue; }
     } else {
-      if (!prefilterPass(blob, 2)) { bump(job.company, 'filtered'); continue; }
+      if (!prefilterPass(job)) { bump(job.company, "filtered"); continue; }
     }
     passed++;
 
     const sk = seenKey(job.url);
     const fp = fingerprintKey(job);
+
     try {
       if (await kvGet(sk)) { dupes++; continue; }
-      if (await kvGet(fp)) { dupes++; report.push(`dup (cross-source): ${job.title.slice(0, 40)}`); continue; }
-      // Mark seen BEFORE analyzing so a failed analyze doesn't retry next run.
-      await kvPut(sk, String(Date.now()), CONFIG.SEEN_TTL_SECONDS);
-      await kvPut(fp, String(Date.now()), CONFIG.SEEN_TTL_SECONDS);
+      if (await kvGet(fp)) {
+        dupes++;
+        report.push(`dup (cross-source): ${job.title.slice(0, 40)}`);
+        continue;
+      }
     } catch (e) {
-      report.push(`KV error: ${e.message}`);
-      continue;
+      report.push(`KV read error: ${e.message}`);
     }
 
     attempts++;
-    // For aggregator jobs (Adzuna/Jooble), resolve the real apply destination behind
-    // their tracking link, so the dashboard can offer a direct-apply button. Only kept
-    // if it actually differs from the aggregator URL and left their domain.
-    if (/adzuna\.|jooble\.org/i.test(job.url)) {
-      const resolved = await resolveFinalUrl(job.url);
-      if (resolved && resolved !== job.url && !/adzuna\.|jooble\.org/i.test(resolved)) {
+
+    // Resolve off-aggregator apply destination if available
+    if (/adzuna\.|jooble\.org|linkedin\.com/i.test(job.url) && !job.directApplyUrl) {
+      const resolved = await resolveDirectApplyUrl(job.url);
+      if (resolved && resolved !== job.url) {
         job.directApplyUrl = resolved;
       }
     }
+
     const ok = await analyzeAndSave(job, report);
-    if (ok) { analyzed++; bump(job.company, 'analyzed'); }
+    if (ok) {
+      analyzed++;
+      bump(job.company, "analyzed");
+
+      // CRITICAL FIX: Only write permanent dedup keys to KV on SUCCESSFUL analysis.
+      // If the analyzer had a 500 error, network hiccup, or Gemini blip, the job
+      // will NOT be burned and can retry next run.
+      try {
+        await kvPut(sk, String(Date.now()), CONFIG.SEEN_TTL_SECONDS);
+        await kvPut(fp, String(Date.now()), CONFIG.SEEN_TTL_SECONDS);
+      } catch (e) {
+        report.push(`KV put error: ${e.message}`);
+      }
+    }
+
+    // Polite delay between analyzer calls to prevent Gemini/Worker rate limit spikes
+    await sleep(150);
   }
 
   const sourceDiag = Object.keys(srcStats).sort().map(k => {
@@ -704,8 +1080,15 @@ async function main() {
     sourceDiagnostics: sourceDiag,
   };
 
-  try { await kvPut("discovery:last_run", JSON.stringify(summary)); } catch (e) { console.error("Failed to save summary:", e.message); }
+  try {
+    await kvPut("discovery:last_run", JSON.stringify(summary));
+  } catch (e) {
+    console.error("Failed to save summary:", e.message);
+  }
   console.log(JSON.stringify(summary, null, 2));
 }
 
-main().catch(e => { console.error("Fatal:", e); process.exit(1); });
+main().catch(e => {
+  console.error("Fatal:", e);
+  process.exit(1);
+});

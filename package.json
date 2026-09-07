@@ -1,0 +1,16 @@
+{
+  "name": "career-discovery-niyas",
+  "version": "1.0.0",
+  "description": "Automated L&D / Instructional Design job discovery job for Niyas",
+  "main": "discovery_niyas.mjs",
+  "type": "module",
+  "scripts": {
+    "start": "node discovery_niyas.mjs",
+    "test": "node --check discovery_niyas.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "author": "Niyas",
+  "license": "MIT"
+}
