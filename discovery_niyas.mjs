@@ -65,8 +65,13 @@ const CONFIG = {
   // ---- JOOBLE (Lifetime free quota of 500 requests — bundled queries) ----
   JOOBLE_ENABLED: true,
   JOOBLE_LOCATIONS: [
-    "United Kingdom", "United States", "Canada", "Australia", "India", "Singapore",
-    "United Arab Emirates", "Dubai", "Germany", "Netherlands", "Ireland", "Remote",
+    "Remote",
+    "India",
+    "United Arab Emirates",
+    "Dubai",
+    "Singapore",
+    "United States Remote",
+    "United Kingdom Remote",
   ],
   // Comma-separated query bundles all keywords into a single Jooble request per location.
   JOOBLE_COMBINED_KEYWORDS: "instructional designer, elearning developer, learning experience designer, l&d specialist",
@@ -180,9 +185,35 @@ function isTitleExcluded(title) {
   return EXCLUDED_TITLE_PATTERNS.some(re => re.test(t));
 }
 
+function isLocationEligible(job) {
+  const loc = (job.location || "").toLowerCase();
+  const text = `${job.title || ""} ${job.location || ""} ${job.description || ""}`.toLowerCase();
+
+  // If directly from company ATS (Greenhouse, Lever, Ashby, etc.), keep it
+  const url = job.url || "";
+  const isAggregator = /jooble\.org|adzuna\./i.test(url);
+  if (!isAggregator) return true;
+
+  // India, UAE, and Singapore are direct hiring/relocation markets for Niyas
+  if (/india|bengaluru|bangalore|hyderabad|mumbai|delhi|pune|chennai|noida|gurgaon/.test(loc)) return true;
+  if (/dubai|abu dhabi|uae|emirates|singapore/.test(loc)) return true;
+
+  // Remote roles are eligible anywhere
+  if (/remote|work from home|wfh|anywhere|worldwide|distributed|virtual/.test(loc)) return true;
+  if (/\b(?:100%\s*remote|fully\s*remote|remote\s*(?:first|eligible|friendly|option)|work\s*from\s*anywhere)\b/.test(text)) return true;
+
+  // Roles with visa sponsorship or relocation assistance
+  if (/visa\s*(?:sponsorship|sponsored|support)|relocation\s*(?:assistance|provided|support|package)/.test(text)) return true;
+
+  // Otherwise, an on-site job in US/UK/Canada/EU from Jooble/Adzuna requires local presence
+  // and Jooble blocks the candidate with "This position requires local presence"
+  return false;
+}
+
 function prefilterPass(job) {
   const title = job.title || "";
   if (isTitleExcluded(title)) return false;
+  if (!isLocationEligible(job)) return false;
 
   const text = `${title} ${job.location || ""} ${job.description || ""}`.toLowerCase();
   if (text.length < 40) return false;
@@ -599,6 +630,7 @@ async function pickAdzunaSlice() {
 async function fetchJooble(location, report) {
   if (!ENV.JOOBLE_API_KEY) return [];
   try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
     const res = await fetch(`https://jooble.org/api/${ENV.JOOBLE_API_KEY}`, {
       method: "POST",
       headers: {
@@ -609,6 +641,7 @@ async function fetchJooble(location, report) {
       body: JSON.stringify({
         keywords: CONFIG.JOOBLE_COMBINED_KEYWORDS,
         location,
+        datecreatedfrom: sevenDaysAgo,
         page: "1",
         ResultOnPage: CONFIG.JOOBLE_RESULTS_PER_CALL,
       }),

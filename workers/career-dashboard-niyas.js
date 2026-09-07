@@ -29,14 +29,30 @@ export default {
 
     if (url.pathname === "/api/jobs" && request.method === "GET") {
       try {
-        // Read ONE page per request. Free plan allows 1000 internal subrequests per
-        // invocation and each KV get counts as one — so cap the page well under it.
-        const startCursor = url.searchParams.get("cursor") || undefined;
-        const page = await env.JOBS_KV.list({ prefix: "jobs:", limit: 900, cursor: startCursor });
+        // Cutoff: Only return jobs created >= 1788751321543 (the single preserved Siemens job
+        // and all subsequent new jobs). This completely ignores the 3,786 historical jobs from
+        // 65 days ago that cause 15s loading lag and expired/unreachable links.
+        const CUTOFF = 1788751321543;
+        let matchedKeys = [];
+        let cursor = undefined;
+        do {
+          const page = await env.JOBS_KV.list({ prefix: "jobs:", limit: 1000, cursor });
+          for (const k of page.keys) {
+            const parts = k.name.replace("jobs:", "").split("-");
+            const ts = parseInt(parts[0], 10);
+            if (!isNaN(ts)) {
+              if (ts >= CUTOFF) matchedKeys.push(k);
+            } else {
+              matchedKeys.push(k);
+            }
+          }
+          cursor = page.list_complete ? null : page.cursor;
+        } while (cursor);
+
         const jobs = [];
         const BATCH = 64;
-        for (let i = 0; i < page.keys.length; i += BATCH) {
-          const values = await Promise.all(page.keys.slice(i, i + BATCH).map(k => env.JOBS_KV.get(k.name)));
+        for (let i = 0; i < matchedKeys.length; i += BATCH) {
+          const values = await Promise.all(matchedKeys.slice(i, i + BATCH).map(k => env.JOBS_KV.get(k.name)));
           for (const value of values) {
             if (value) { try { jobs.push(JSON.parse(value)); } catch {} }
           }
@@ -44,8 +60,8 @@ export default {
         return jsonResponse({
           jobs,
           count: jobs.length,
-          cursor: page.list_complete ? null : page.cursor,
-          list_complete: !!page.list_complete
+          cursor: null,
+          list_complete: true
         });
       } catch (e) {
         return jsonResponse({ error: e.message }, 500);
@@ -1097,6 +1113,12 @@ function applyButtons(job) {
   if (v && v !== apply) {
     const name = aggregatorName(job) || 'source';
     html += '<button class="btn-view" title="Read the job description on ' + name + ' — viewable even when the source is country-locked" onclick="window.open(\'' + escapeHtml(v) + '\', \'_blank\')"><i class="ti ti-file-text"></i>View JD on ' + name + '</button>';
+  }
+  const comp = (job.analysis && job.analysis.company) || '';
+  const role = (job.analysis && job.analysis.role) || job.pageTitle || '';
+  if (comp || role) {
+    const q = encodeURIComponent((comp + ' ' + role + ' careers apply').trim());
+    html += '<button class="btn-view" title="Search directly on Google for the employer\'s official career portal (bypasses aggregator expiration/location restrictions)" onclick="window.open(\'https://www.google.com/search?q=' + q + '\', \'_blank\')"><i class="ti ti-search"></i>Direct Employer Search</button>';
   }
   return html;
 }
